@@ -1,0 +1,1486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DTDC P&L Analyser — DEV SERVICE POINT EF1478</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='12' fill='%23CC0000'/><text y='.9em' font-size='80' x='10'>📦</text></svg>"/>
+
+  <!-- React 18 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <!-- Babel (JSX in browser) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <!-- SheetJS (Excel) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#080b14;font-family:sans-serif;}
+    #root{min-height:100vh;}
+    #splash{position:fixed;inset:0;background:#080b14;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;z-index:9999;}
+    #splash svg{animation:spin 1s linear infinite;}
+    @keyframes spin{to{transform:rotate(360deg);}}
+    #splash p{color:#888;font-size:14px;font-family:sans-serif;}
+    #splash h2{color:#f5a623;font-size:22px;font-family:sans-serif;font-weight:700;}
+  </style>
+</head>
+<body>
+
+<!-- Loading splash -->
+<div id="splash">
+  <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="24" cy="24" r="20" stroke="#f5a623" stroke-width="4" stroke-dasharray="80 40" stroke-linecap="round"/>
+  </svg>
+  <h2>📦 DTDC P&L Analyser</h2>
+  <p>Loading app… please wait</p>
+</div>
+
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+  // ── CDN globals ─────────────────────────────────────────────────
+  const { useState, useRef, useEffect, useCallback } = React;
+  // XLSX is window.XLSX from CDN
+
+
+/* ═══════════════════════════════════════════════════════════
+   PDF.js  loader
+═══════════════════════════════════════════════════════════ */
+const loadPDF = () =>
+  new Promise((res, rej) => {
+    if (window.pdfjsLib) { res(window.pdfjsLib); return; }
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      res(window.pdfjsLib);
+    };
+    s.onerror = rej;
+    document.head.appendChild(s);
+  });
+
+async function pdfText(buf) {
+  const lib = await loadPDF();
+  const pdf = await lib.getDocument({ data: buf }).promise;
+  let out = "";
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const c = await page.getTextContent();
+    out += c.items.map(i => i.str).join(" ") + "\n";
+  }
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PARSERS
+═══════════════════════════════════════════════════════════ */
+// Parse DTDC franchise XLSX bill (InvoiceData sheet)
+function parseDTDCXlsx(buffer) {
+  const wb = XLSX.read(buffer, { type: "array" });
+  const ws = wb.Sheets["InvoiceData"];
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  let iH = -1, cH = -1;
+  raw.forEach((r, i) => {
+    if (r[0] === "frcode") iH = i;
+    if (r[0] === "consgNumber") cH = i;
+  });
+
+  const invHeaders = raw[iH], invRow = raw[iH + 1];
+  const inv = {};
+  invHeaders.forEach((h, i) => (inv[h] = invRow[i]));
+
+  const conHeaders = raw[cH];
+  const consignments = [];
+  for (let i = cH + 1; i < raw.length; i++) {
+    if (!raw[i][0]) break;
+    const row = {};
+    conHeaders.forEach((h, j) => (row[h] = raw[i][j]));
+    if (row.consgNumber) consignments.push(row);
+  }
+  return {
+    invoiceNo: inv.invoiceNumber || "",
+    invoiceDate: inv.invoiceDate || "",
+    invoiceTotal: parseFloat(inv.totalInvoiceValue) || 0,
+    baseAmount: parseFloat(inv.invoiceAmount) || 0,
+    fuelCharge: parseFloat(inv.fuelCharge) || 0,
+    serviceCharge: parseFloat(inv.serviceCharge) || 0,
+    cgst: parseFloat(inv.CGSTAmount) || 0,
+    sgst: parseFloat(inv.SGSTAmount) || 0,
+    consignments,
+    source: "xlsx",
+  };
+}
+
+// Parse DTDC franchise PDF bill (summary; consignment rows if present)
+function parseDTDCPdf(text) {
+  const invMatch = text.match(/(?:Invoice No\.?|Invoice\s+No)\s*[:\-]?\s*(TN\d+\w+|IN\d+\w+)/i);
+  const invNo = invMatch ? invMatch[1] : text.match(/TN\d{4}\w{8,}/)?.[0] || "Unknown";
+
+  const totalMatch = text.match(/Total Invoice Value[\s\S]{0,30}?([\d,]+\.\d{2})/);
+  const invoiceTotal = totalMatch ? parseFloat(totalMatch[1].replace(/,/g, "")) : 0;
+
+  const baseMatch = text.match(/Invoice Amt[\s\S]{0,30}?([\d,]+\.\d{2})/);
+  const baseAmount = baseMatch ? parseFloat(baseMatch[1].replace(/,/g, "")) : 0;
+
+  const fuelMatch = text.match(/Fuel\s*(?:Surcharge)?[\s\S]{0,20}?([\d,]+\.\d{2})/i);
+  const fuelCharge = fuelMatch ? parseFloat(fuelMatch[1].replace(/,/g, "")) : 0;
+
+  // Try to extract consignment rows  e.g.  C57828450  02/03/26  TRICHY  D  0.100  1  40.00 ...
+  const rows = [];
+  const re = /([CD]\d{8,13})\s+(\d{2}[\/\-]\d{2}[\/\-]\d{2,4})\s+([A-Z]+(?:\s[A-Z]+)?)\s+[DN]\s+([\d.]+)(?:\s+\d+)?\s+([\d,]+\.?\d*)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    rows.push({
+      consgNumber: m[1],
+      bookingDate: m[2],
+      destination: m[3].trim(),
+      weight: m[4],
+      transhipment: parseFloat(m[5].replace(/,/g, "")),
+    });
+  }
+
+  return { invoiceNo: invNo, invoiceTotal, baseAmount, fuelCharge, consignments: rows, source: "pdf" };
+}
+
+// Parse customer GIN invoice PDF
+function parseCustomerPdf(text) {
+  // ── GIN Invoice Number ──────────────────────────────────────────
+  const gin = text.match(/GIN\d{7}/)?.[0] || "Unknown";
+
+  // ── Customer Name ───────────────────────────────────────────────
+  // PDF page-2 header pattern: "Customer Name: 01.04.2026 SRI MEENAKSHI PNEUMATICS EF1478"
+  let name = "Unknown";
+  const nm2 = text.match(/Customer Name:\s+[\d.]+\s+([A-Z][A-Z\s&./(),-]{3,60})(?=\s+EF\d)/);
+  if (nm2) {
+    name = nm2[1].trim().replace(/\s+/g, " ");
+  } else {
+    // Fallback: "TO [Customer Code: XXX] CUSTOMER NAME ..."
+    const nm1 = text.match(/\bTO\b\s+(?:Customer Code:\s*\S+\s+)?([A-Z][A-Z\s&./()-]{4,60})(?=\s+[\d,]|\s+GSTIN|\s+State\s+Code)/);
+    if (nm1) name = nm1[1].trim().replace(/\s+/g, " ");
+  }
+
+  // ── Total Invoice Value ─────────────────────────────────────────
+  // BUG FIX: PDF text has "Service Description" between label and amount:
+  // "Total Invoice Value (INR) Service Description  8,407.50 Courier Services"
+  const tiv = text.match(/Total Invoice Value \(INR\)\s+(?:[A-Za-z\s]+\s+)?([\d,]+\.\d{2})/i);
+  const totalInvoiceValue = tiv ? parseFloat(tiv[1].replace(/,/g, "")) : 0;
+
+  // ── Freight Charges ─────────────────────────────────────────────
+  const fc = text.match(/Freight Charges\s+([\d,]+\.\d{2})/i);
+  const freightCharges = fc ? parseFloat(fc[1].replace(/,/g, "")) : 0;
+
+  // ── GST ─────────────────────────────────────────────────────────
+  const cgst = text.match(/CGST @ [\d.]+%\s+([\d,]+\.\d{2})/i);
+  const sgst = text.match(/SGST[/\w]* @ [\d.]+%\s+([\d,]+\.\d{2})/i);
+  const gst = (cgst ? parseFloat(cgst[1].replace(/,/g,"")) : 0) + (sgst ? parseFloat(sgst[1].replace(/,/g,"")) : 0);
+
+  // ── Consignment Rows ────────────────────────────────────────────
+  // PDF text row: "1 C57828450 02/03/26 TRICHY D 0.100 1 40.00 0.00 0.00 40.00"
+  // Extract: cnote, date, destination (1-3 words), weight, first amount = freight
+  const rows = [];
+  const seen = new Set();
+  const re = /\b([CD]\d{8,13})\s+(\d{2}\/\d{2}\/\d{2})\s+([A-Z]+(?:\s+[A-Z]+){0,2})\s+[DN]\s+([\d.]+)(?:\s+\d+)?\s+([\d,]+\.\d{2})/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (!seen.has(m[1])) {
+      seen.add(m[1]);
+      rows.push({
+        cnote: m[1],
+        date: m[2],
+        destination: m[3].trim(),
+        weight: parseFloat(m[4]),
+        myRate: parseFloat(m[5].replace(/,/g, "")),
+      });
+    }
+  }
+
+  return { invoiceNo: gin, customerName: name, totalInvoiceValue, freightCharges, gst, consignments: rows, source: "pdf" };
+}
+
+// Parse customer GIN invoice Excel (.xls or .xlsx)
+function parseCustomerXlsx(buffer) {
+  // SheetJS handles both .xls (BIFF8) and .xlsx automatically from raw bytes
+  const wb = XLSX.read(buffer, { type: "array", cellDates: true });
+
+  // Try to find the most data-rich sheet (prefer names with invoice/data keywords)
+  const sheetName =
+    wb.SheetNames.find(n => /invoice|data|bill|customer|consign/i.test(n)) ||
+    wb.SheetNames.reduce((best, name) => {
+      const len = (XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: "" })).length;
+      return len > ((XLSX.utils.sheet_to_json(wb.Sheets[best], { header: 1, defval: "" })).length) ? name : best;
+    }, wb.SheetNames[0]);
+
+  const ws = wb.Sheets[sheetName];
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  // Helper: flatten a row to a single string safely
+  const rowStr = r => r.map(c => (c == null ? "" : c.toString())).join(" ");
+
+  // --- Extract GIN invoice number ---
+  let gin = "Unknown";
+  for (const row of raw) {
+    const m = rowStr(row).match(/GIN\d{5,9}/i);
+    if (m) { gin = m[0].toUpperCase(); break; }
+  }
+
+  // --- Extract customer name ---
+  let customerName = "Unknown";
+  for (const row of raw) {
+    const s = rowStr(row);
+    const m = s.match(/Customer\s*Name[:\s]+([A-Za-z][A-Za-z0-9\s&./(),-]{3,60})/i);
+    if (m) { customerName = m[1].trim().replace(/\s+/g, " "); break; }
+  }
+  // Fallback: look for "TO" keyword
+  if (customerName === "Unknown") {
+    for (const row of raw) {
+      const s = rowStr(row);
+      const m = s.match(/\bTO[:\s]+([A-Za-z][A-Za-z0-9\s&./(),-]{3,60})/i);
+      if (m) { customerName = m[1].trim().replace(/\s+/g, " "); break; }
+    }
+  }
+
+  // --- Find header row: look for a row containing a C-note column keyword ---
+  // Also accept "sl.no", "s.no", "no." style headers indicating a data table
+  let hdrIdx = -1;
+  raw.forEach((row, i) => {
+    const s = rowStr(row).toLowerCase();
+    if (/c.?note|consign|awb|tracking|docket|shipment.?no/i.test(s)) hdrIdx = i;
+  });
+
+  // If no header found, scan for rows that contain actual C-note patterns (C/D followed by digits)
+  let consignments = [];
+  const CNOTE_RE = /\b([CD]\d{8,13})\b/;
+
+  if (hdrIdx >= 0) {
+    const headers = raw[hdrIdx].map(h => (h == null ? "" : h.toString()).toLowerCase().trim());
+    const ci  = headers.findIndex(h => /c.?note|consign|awb|tracking|docket|shipment/i.test(h));
+    const di  = headers.findIndex(h => /dest|city|to\b/i.test(h));
+    const wi  = headers.findIndex(h => /\bwt\b|weight/i.test(h));
+    // Amount column: prefer "freight" or "amount" but NOT "gst" or "tax"
+    const ai  = headers.findIndex(h => /freight|^amount$|^rate$|^charge$/i.test(h));
+    const ai2 = ai >= 0 ? ai : headers.findIndex(h => /amount|charge|rate/i.test(h) && !/gst|tax|igst|cgst|sgst/i.test(h));
+    const dti = headers.findIndex(h => /\bdate\b/i.test(h));
+
+    const seen = new Set();
+    for (let i = hdrIdx + 1; i < raw.length; i++) {
+      const row = raw[i];
+      const rs = rowStr(row);
+      if (!rs.trim()) continue;
+
+      // Get C-note: from detected column or scan the whole row
+      let cnote = ci >= 0 ? (row[ci] || "").toString().trim() : "";
+      if (!cnote || !CNOTE_RE.test(cnote)) {
+        const m = rs.match(CNOTE_RE);
+        if (m) cnote = m[1];
+      }
+      if (!cnote || seen.has(cnote)) continue;
+      seen.add(cnote);
+
+      const rawAmt = ai2 >= 0 ? parseFloat((row[ai2] || "").toString().replace(/[^\d.]/g, "")) || 0 : 0;
+      consignments.push({
+        cnote,
+        date:        dti >= 0 ? (row[dti] || "").toString().trim() : "",
+        destination: di  >= 0 ? (row[di]  || "").toString().trim() : "",
+        weight:      wi  >= 0 ? parseFloat((row[wi] || "").toString()) || 0 : 0,
+        myRate:      rawAmt,   // base freight amount (excl. GST)
+      });
+    }
+  } else {
+    // No header row found — scan every row for C-note pattern
+    const seen = new Set();
+    for (const row of raw) {
+      const rs = rowStr(row);
+      const m = rs.match(CNOTE_RE);
+      if (!m) continue;
+      const cnote = m[1];
+      if (seen.has(cnote)) continue;
+      seen.add(cnote);
+      // Try to extract a numeric amount from the same row
+      const nums = [...rs.matchAll(/([\d,]+\.\d{2})/g)].map(x => parseFloat(x[1].replace(/,/g,"")));
+      const myRate = nums.length ? nums[nums.length - 1] : 0; // last number is usually the amount
+      consignments.push({ cnote, date: "", destination: "", weight: 0, myRate });
+    }
+  }
+
+  // --- GST 18% auto-calculation ---
+  // myRate stored above is the BASE freight (pre-GST)
+  // Each consignment's billing = base + 18% GST
+  const GST_RATE = 0.18;
+  consignments = consignments.map(c => ({
+    ...c,
+    baseRate: c.myRate,
+    gstAmt:   parseFloat((c.myRate * GST_RATE).toFixed(2)),
+    myRate:   parseFloat((c.myRate * (1 + GST_RATE)).toFixed(2)), // total billed to customer
+  }));
+
+  // --- Total invoice value ---
+  let totalInvoiceValue = 0;
+  for (const row of raw) {
+    const s = rowStr(row);
+    const m = s.match(/Total\s+Invoice\s+Value[^\d]*([\d,]+\.?\d*)/i)
+           || s.match(/Grand\s+Total[^\d]*([\d,]+\.?\d*)/i)
+           || s.match(/Invoice\s+Total[^\d]*([\d,]+\.?\d*)/i);
+    if (m) { totalInvoiceValue = parseFloat(m[1].replace(/,/g, "")); break; }
+  }
+  // Fallback: sum of consignment totals (already incl. GST)
+  if (!totalInvoiceValue && consignments.length) {
+    totalInvoiceValue = parseFloat(consignments.reduce((s, c) => s + c.myRate, 0).toFixed(2));
+  }
+
+  const baseTotal = parseFloat(consignments.reduce((s, c) => s + c.baseRate, 0).toFixed(2));
+  const gstTotal  = parseFloat(consignments.reduce((s, c) => s + c.gstAmt,  0).toFixed(2));
+
+  return {
+    invoiceNo: gin,
+    customerName,
+    totalInvoiceValue,
+    baseFreight: baseTotal,
+    gstAmount: gstTotal,
+    freightCharges: baseTotal,
+    gst: gstTotal,
+    consignments,
+    source: "xls",
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RATE CARD
+═══════════════════════════════════════════════════════════ */
+const TN  = new Set(["TRICHY","CHENNAI","COIMBATORE","DINDIGUL","SALEM","TIRUPUR","TUTICORIN","NAGERCOIL","THANJAVUR","ERODE","SIVAKASI","KARUR","THENI","TIRUNE","TIRUNELVELI","KATPADI","PONDICHERRY","KARAIKUDI","SIVAGANGAI","TENKASI","RAMANATHAPURAM","VIRUDHUNAGAR","AMBUR","HOSUR","VILUPURAM","CUDDALORE","KUMBAKONAM","NAGAPATTINAM","VELLORE","NAMAKKAL","PERAMBALUR","ARIYALUR","PUDUKKOTTAI"]);
+const AP  = new Set(["BANGALORE","HYDERABAD","COCHIN","TRIVANDRUM","ERNAKULAM","VISHAKAPATNAM","VISAKHAPATNAM","MAHABUBNAGAR","VIJAYAWADA","CALICUT","MANGALORE","MYSORE","HUBLI","MEDAK","NELLORE","GURGAON","SOLAPUR","KOCHI","THRISSUR","WARANGAL","BENGALURU","KURNOOL","ANANTAPUR"]);
+const NM  = new Set(["MUMBAI","PUNE","DELHI","KOLKATA","AHMEDABAD","VASHI","NEW DELHI","NAVI MUMBAI"]);
+const NE  = new Set(["ASSAM","ANDAMAN","JAMMU","SRINAGAR","BAREIL","BAREILLY","GUWAHATI","IMPHAL","AGARTALA","SHILLONG"]);
+
+const ZONES = { MADURAI_CITY:"Madurai City", TAMIL_NADU:"Tamil Nadu", AP_KA_KL_TS:"AP / KA / KL / TS", NORTH_METRO:"North Metro", NORTH_OTHERS:"North Others", NORTH_EAST:"North East" };
+const ZCOLORS = { MADURAI_CITY:"#ff6b35", TAMIL_NADU:"#00d4aa", AP_KA_KL_TS:"#7c4dff", NORTH_METRO:"#00b0ff", NORTH_OTHERS:"#ffab00", NORTH_EAST:"#ff4081" };
+const RATES = {
+  MADURAI_CITY: [40,  50,  80,  20],   // Local — not in standard tariff
+  TAMIL_NADU:   [60,  70,  100, 70],   // Surface — per DTDC Standard Tariff
+  AP_KA_KL_TS:  [80,  100, 130, 90],   // Surface — per DTDC Standard Tariff
+  NORTH_METRO:  [120, 160, 230, 190],  // Air (Delhi/Mumbai/Pune/Ahmedabad/Kolkata)
+  NORTH_OTHERS: [120, 180, 250, 200],  // Air — North Others
+  NORTH_EAST:   [140, 200, 300, 250],  // Air — J&K, Assam, Andaman
+};
+
+function zone(dest) {
+  const d = (dest || "").toUpperCase().trim();
+  if (d === "MADURAI") return "MADURAI_CITY";
+  if (TN.has(d))  return "TAMIL_NADU";
+  if (AP.has(d))  return "AP_KA_KL_TS";
+  if (NM.has(d))  return "NORTH_METRO";
+  if (NE.has(d))  return "NORTH_EAST";
+  return "NORTH_OTHERS";
+}
+const GST_RATE = 0.18;
+
+// V-Series Premium Tariff — 3 slabs only (per DTDC Premium Tariff pptx)
+const PREMIUM_RATES = {
+  MADURAI_CITY: [120, 150, 175],
+  TAMIL_NADU:   [240, 300, 350],
+  AP_KA_KL_TS:  [320, 380, 460],
+  NORTH_METRO:  [360, 420, 600],
+  NORTH_OTHERS: [400, 480, 700],
+  NORTH_EAST:   [450, 520, 750],
+};
+
+// rate(zone, weight, rateType)
+// Standard slab logic (Tamil Nadu example):
+//   ≤250g=60  ≤500g=70  ≤1kg=100
+//   1–5kg: 100 + ceil(wt-1) × 70   → 1.3kg→2kg→100+1×70=170  2.5kg→3kg→100+2×70=240
+//   >5kg:  ceil(wt) × 70            → 5kg=350  6kg=420  7kg=490
+function rate(z, w, rateType) {
+  const wt = parseFloat(w) || 0;
+  if (rateType === "premium") {
+    const r = PREMIUM_RATES[z] || PREMIUM_RATES.NORTH_OTHERS;
+    if (wt <= 0.25) return r[0];
+    if (wt <= 0.5)  return r[1];
+    if (wt <= 1.0)  return r[2];
+    // above 1kg: ceil to next full kg × 1kg-rate
+    return Math.ceil(wt) * r[2];
+  }
+  const r = RATES[z] || RATES.NORTH_OTHERS;
+  if (wt <= 0.25) return r[0];
+  if (wt <= 0.5)  return r[1];
+  if (wt <= 1.0)  return r[2];
+  if (wt <= 5.0)  return r[2] + Math.ceil(wt - 1) * r[3];  // 1.3→ceil(0.3)=1 extra kg
+  return Math.ceil(wt) * r[3];                               // >5kg: full kg × per-kg rate
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CORE ENGINE
+═══════════════════════════════════════════════════════════ */
+function calculate({ dtdcBills, customerPDFs, manualCustomers, expenses }) {
+  // Merge all DTDC consignments + build cost map
+  let allCons = [], totalFull = 0, totalBase = 0;
+  dtdcBills.forEach(b => {
+    totalFull += b.invoiceTotal;
+    b.consignments.forEach(c => {
+      const t = parseFloat(c.transhipment) || 0;
+      totalBase += t;
+      allCons.push({ ...c, _t: t, consgNumber: (c.consgNumber || "").toString().trim() });
+    });
+  });
+  const ratio = totalBase > 0 ? totalFull / totalBase : 1;
+
+  const costMap = {};
+  allCons.forEach(c => { costMap[c.consgNumber] = (c._t || 0) * ratio; });
+
+  // Build known C-note sets
+  const customers = [
+    ...customerPDFs.map(p => ({
+      name: p.customerName, invoice: p.invoiceNo, source: p.source,
+      rateType: p.rateType || "standard",
+      revenue: p.totalInvoiceValue,
+      cnoteMap: Object.fromEntries(p.consignments.map(c => [c.cnote, c])),
+      cnotes: p.consignments.map(c => c.cnote),
+    })),
+    ...manualCustomers.filter(m => m.name && m.cnotesRaw).map(m => ({
+      name: m.name, invoice: m.invoice, source: "manual", rateType: m.rateType || "standard",
+      revenue: parseFloat(m.revenue) || 0,
+      cnoteMap: {},
+      cnotes: m.cnotesRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
+    })),
+  ];
+
+  const knownSet = new Set(customers.flatMap(c => c.cnotes));
+
+  // Segments
+  const segments = customers.map((cust, ci) => {
+    const consDetail = cust.cnotes.map(cn => {
+      const row = allCons.find(r => r.consgNumber === cn);
+      const dest = row ? (row.destination || "") : "";
+      const wt   = row ? parseFloat(row.weight) || 0 : 0;
+      const z    = zone(dest);
+      const dtdcCost = costMap[cn] || 0;
+      const myRt = cust.cnoteMap[cn]?.myRate ?? rate(z, wt, cust.rateType || "standard");
+      return { cn, date: row?.bookingDate || "", dest, weight: wt, zone: z, myRate: myRt, dtdcCost, profit: myRt - dtdcCost };
+    });
+    const dtdc = consDetail.reduce((s, c) => s + c.dtdcCost, 0);
+    const rev  = cust.revenue || consDetail.reduce((s, c) => s + c.myRate, 0);
+    return { name: cust.name, invoice: cust.invoice, source: cust.source, rateType: cust.rateType || "standard", ships: consDetail.length, revenue: rev, dtdc, gross: rev - dtdc, consDetail };
+  });
+
+  // Walk-in
+  const walkin = allCons.filter(c => !knownSet.has(c.consgNumber)).map(c => {
+    const dest = (c.destination || "").toString().trim();
+    const wt   = parseFloat(c.weight) || 0;
+    const z    = zone(dest);
+    const myRt = rate(z, wt);
+    const dtdcCost = (c._t || 0) * ratio;
+    return { cn: c.consgNumber, date: c.bookingDate || "", dest, weight: wt, zone: z, myRate: myRt, dtdcCost, profit: myRt - dtdcCost };
+  });
+
+  const wRev  = walkin.reduce((s, c) => s + c.myRate, 0);
+  const wDtdc = walkin.reduce((s, c) => s + c.dtdcCost, 0);
+  segments.push({ name: "Walk-in Customers", invoice: "Rate Card", source: "auto", ships: walkin.length, revenue: wRev, dtdc: wDtdc, gross: wRev - wDtdc, consDetail: walkin, isWalkin: true });
+
+  const totalExp = expenses.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
+  const totalShips = segments.reduce((s, c) => s + c.ships, 0);
+  segments.forEach(sg => {
+    sg.sharedAlloc = totalShips > 0 ? (sg.ships / totalShips) * totalExp : 0;
+    sg.net = sg.gross - sg.sharedAlloc;
+    sg.margin = sg.revenue > 0 ? (sg.net / sg.revenue) * 100 : 0;
+  });
+
+  const grandRev  = segments.reduce((s, c) => s + c.revenue, 0);
+  const grandDtdc = segments.reduce((s, c) => s + c.dtdc, 0);
+  const grandGross= segments.reduce((s, c) => s + c.gross, 0);
+  const grandNet  = grandGross - totalExp;
+
+  // ── Consignment-level compare: DTDC bill amount vs Customer bill amount ──
+  // Build customer cnote → amount map (from all customer segments)
+  const custAmtMap = {};  // cnote → { customerName, invoice, custAmt }
+  customers.forEach(cust => {
+    cust.cnotes.forEach(cn => {
+      const row = cust.cnoteMap[cn];
+      const custAmt = row?.myRate ?? 0;
+      custAmtMap[cn] = { customerName: cust.name, invoice: cust.invoice, custAmt };
+    });
+  });
+
+  // Walk-in: use rate card amount
+  walkin.forEach(w => {
+    if (!custAmtMap[w.cn]) {
+      custAmtMap[w.cn] = { customerName: "Walk-in", invoice: "Rate Card", custAmt: w.myRate };
+    }
+  });
+
+  const compareRows = allCons.map(c => {
+    const cn = c.consgNumber;
+    const dtdcAmt = (c._t || 0) * ratio;
+    const cInfo = custAmtMap[cn] || { customerName: "—", invoice: "—", custAmt: 0 };
+    const diff = cInfo.custAmt - dtdcAmt;
+    return {
+      cn,
+      date: c.bookingDate || "",
+      destination: (c.destination || "").toString().trim(),
+      weight: parseFloat(c.weight) || 0,
+      dtdcAmt,
+      custAmt: cInfo.custAmt,
+      diff,
+      customerName: cInfo.customerName,
+      invoice: cInfo.invoice,
+    };
+  }).sort((a, b) => a.diff - b.diff); // worst first
+
+  return { segments, walkin, grandRev, grandDtdc, grandGross, grandNet, totalExp, totalShips, totalFull, ratio, dtdcBills, compareRows };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   UI HELPERS
+═══════════════════════════════════════════════════════════ */
+const INR = n => (n < 0 ? "-₹" : "₹") + Math.abs(n).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const SEG_COLORS = ["#ff6b35","#00d4aa","#7c4dff","#ff4081","#00b0ff","#ffab00","#00e676","#e040fb"];
+
+/* DTDC Logo */
+const DTDCLogo = ({ h = 34 }) => (
+  <svg height={h} viewBox="0 0 130 38" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="130" height="38" rx="5" fill="#CC0000"/>
+    <polygon points="6,6 20,19 6,32" fill="#FF4444"/>
+    <text x="28" y="27" fill="white" fontSize="21" fontWeight="900" fontFamily="'Arial Black',sans-serif" letterSpacing="3">DTDC</text>
+  </svg>
+);
+
+/* Drop Zone */
+function DropZone({ label, hint, accept, multiple, onFiles, files, color }) {
+  const ref = useRef();
+  const [drag, setDrag] = useState(false);
+  const drop = e => { e.preventDefault(); setDrag(false); const f = Array.from(e.dataTransfer.files).filter(f => accept.some(a => f.name.toLowerCase().endsWith(a))); if (f.length) onFiles(f); };
+  return (
+    <div className={`dz${drag?" dz-d":""}${files.length?" dz-ok":""}`} style={{"--dc":color}}
+      onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)} onDrop={drop}
+      onClick={()=>ref.current.click()}>
+      <input ref={ref} type="file" multiple={multiple} accept={accept.join(",")} style={{display:"none"}} onChange={e=>onFiles(Array.from(e.target.files))}/>
+      {files.length
+        ? <div className="dz-chips">{files.map(f=><span key={f.name} className="chip">✓ {f.name}</span>)}</div>
+        : <><div className="dz-lbl">{label}</div><div className="dz-hint">{hint}</div></>}
+    </div>
+  );
+}
+
+/* Consignment Detail Modal */
+function DetailModal({ seg, onClose }) {
+  const [q, setQ] = useState("");
+  if (!seg) return null;
+  const rows = (seg.consDetail || []).filter(r => !q || r.cn.includes(q.toUpperCase()) || (r.dest||"").toUpperCase().includes(q.toUpperCase()));
+  const totMy   = rows.reduce((s,r)=>s+r.myRate,0);
+  const totDtdc = rows.reduce((s,r)=>s+r.dtdcCost,0);
+  const totPro  = rows.reduce((s,r)=>s+r.profit,0);
+  return (
+    <div className="mb" onClick={onClose}>
+      <div className="md" onClick={e=>e.stopPropagation()}>
+        <div className="md-hdr">
+          <div>
+            <div className="md-title">{seg.name}</div>
+            <div className="md-sub">{seg.ships} consignments · {seg.invoice} · Net {INR(seg.net)}</div>
+          </div>
+          <button className="x-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="md-body">
+          <input className="inp md-search" placeholder="🔍 Search C-Note or Destination…" value={q} onChange={e=>setQ(e.target.value)}/>
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead><tr><th>C-Note</th><th>Date</th><th>Destination</th><th>Zone</th><th>Wt(kg)</th><th>My Rate ₹</th><th>DTDC Cost ₹</th><th>Profit ₹</th></tr></thead>
+              <tbody>
+                {rows.map((r,i)=>(
+                  <tr key={i} className={r.profit<0?"tr-loss":""}>
+                    <td className="mono">{r.cn}</td>
+                    <td className="muted">{r.date}</td>
+                    <td><b>{r.dest}</b></td>
+                    <td><span className="zbadge" style={{background:ZCOLORS[r.zone]+"22",color:ZCOLORS[r.zone],border:`1px solid ${ZCOLORS[r.zone]}44`}}>{ZONES[r.zone]}</span></td>
+                    <td className="num">{r.weight.toFixed(3)}</td>
+                    <td className="num grn">{r.myRate.toFixed(2)}</td>
+                    <td className="num orn">{r.dtdcCost.toFixed(2)}</td>
+                    <td className={`num bold ${r.profit>=0?"grn":"red"}`}>{r.profit<0?"-":""}{Math.abs(r.profit).toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td colSpan={5}><b>TOTAL ({rows.length})</b></td>
+                  <td className="num grn"><b>{totMy.toFixed(2)}</b></td>
+                  <td className="num orn"><b>{totDtdc.toFixed(2)}</b></td>
+                  <td className={`num bold ${totPro>=0?"grn":"red"}`}><b>{totPro<0?"-":""}{Math.abs(totPro).toFixed(2)}</b></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   APP
+═══════════════════════════════════════════════════════════ */
+function App() {
+  const [step, setStep]       = useState(1);
+  const [dtdcFiles, setDtdcFiles] = useState([]);       // DTDC bills (xlsx or pdf)
+  const [custFiles, setCustFiles]   = useState([]);       // Customer GIN invoices (pdf or xlsx)
+  const [parsedDTDC, setParsedDTDC] = useState([]);
+  const [parsedCusts, setParsedCusts] = useState([]);
+  const [processing, setProcessing] = useState({ dtdc: false, cust: false });
+  const [manual, setManual]   = useState([{ id:1, name:"", invoice:"", revenue:"", cnotesRaw:"", rateType:"standard" }]);
+  const [expenses, setExpenses] = useState([
+    { id:1, label:"Shop Rent",      amount:"5000" },
+    { id:2, label:"Petrol/Travel",  amount:"3000" },
+  ]);
+  const [month, setMonth]     = useState(() => { const d=new Date(); return d.toLocaleString("default",{month:"long"})+" "+d.getFullYear(); });
+  const [result, setResult]   = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState("");
+  const [tab, setTab]         = useState("overview");
+  const [modal, setModal]     = useState(null);
+  const uid = useRef(20);
+
+  /* Parse DTDC bills whenever files change */
+  useEffect(() => {
+    if (!dtdcFiles.length) { setParsedDTDC([]); return; }
+    setProcessing(p=>({...p,dtdc:true}));
+    (async () => {
+      const out = [];
+      for (const f of dtdcFiles) {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        if (f.name.toLowerCase().endsWith(".pdf")) {
+          try { const t = await pdfText(buf); out.push(parseDTDCPdf(t)); } catch(e) { out.push({invoiceNo:f.name,invoiceTotal:0,baseAmount:0,fuelCharge:0,consignments:[],source:"pdf-error"}); }
+        } else {
+          try { out.push(parseDTDCXlsx(buf)); } catch(e) { out.push({invoiceNo:f.name,invoiceTotal:0,baseAmount:0,fuelCharge:0,consignments:[],source:"xlsx-error"}); }
+        }
+      }
+      setParsedDTDC(out);
+      setProcessing(p=>({...p,dtdc:false}));
+    })();
+  }, [dtdcFiles]);
+
+  /* Parse customer PDFs/XLSXs */
+  useEffect(() => {
+    if (!custFiles.length) { setParsedCusts([]); return; }
+    setProcessing(p=>({...p,cust:true}));
+    (async () => {
+      const out = [];
+      for (const f of custFiles) {
+        // Derive customer name from filename: strip extension, replace _ and - with spaces, trim
+        const nameFromFile = f.name
+          .replace(/\.[^.]+$/, "")           // remove extension
+          .replace(/[_\-]+/g, " ")            // underscores/hyphens → spaces
+          .replace(/\s+/g, " ")
+          .trim()
+          .toUpperCase();
+        // V-series: filename starts with "V " or "V-" or "V_" → Premium rate
+        const rateType = /^V[\s_\-]/i.test(f.name.replace(/\.[^.]+$/, "")) ? "premium" : "standard";
+        try {
+          const buf = new Uint8Array(await f.arrayBuffer());
+          let parsed;
+          if (/\.xls[xm]?$/i.test(f.name)) {
+            parsed = parseCustomerXlsx(buf);
+          } else {
+            const t = await pdfText(buf);
+            parsed = parseCustomerPdf(t);
+          }
+          // Always use filename as customer name; tag rateType
+          out.push({ ...parsed, customerName: nameFromFile, rateType });
+        }
+        catch(e) { out.push({invoiceNo:"Error", customerName: nameFromFile, rateType, totalInvoiceValue:0, freightCharges:0, consignments:[], source:"error"}); }
+      }
+      setParsedCusts(out);
+      setProcessing(p=>({...p,cust:false}));
+    })();
+  }, [custFiles]);
+
+  const addExp   = () => setExpenses(p=>[...p,{id:uid.current++,label:"",amount:""}]);
+  const updExp   = (id,k,v) => setExpenses(p=>p.map(e=>e.id===id?{...e,[k]:v}:e));
+  const rmExp    = id => setExpenses(p=>p.filter(e=>e.id!==id));
+  const addMan   = () => setManual(p=>[...p,{id:uid.current++,name:"",invoice:"",revenue:"",cnotesRaw:"",rateType:"standard"}]);
+  const updMan   = (id,k,v) => setManual(p=>p.map(m=>m.id===id?{...m,[k]:v}:m));
+  const rmMan    = id => setManual(p=>p.filter(m=>m.id!==id));
+
+  const totalExpAmt = expenses.reduce((s,e)=>s+(parseFloat(e.amount)||0),0);
+
+  const run = async () => {
+    setError("");
+    if (!parsedDTDC.length) { setError("Please upload at least one DTDC bill (XLSX or PDF)."); return; }
+    setLoading(true);
+    try {
+      const custPDFData = parsedCusts.map(p=>({
+        ...p,
+        cnotes: p.consignments.map(c=>c.cnote),
+        cnoteMap: Object.fromEntries(p.consignments.map(c=>[c.cnote,c])),
+      }));
+      const data = calculate({ dtdcBills: parsedDTDC, customerPDFs: custPDFData, manualCustomers: manual, expenses });
+      setResult(data); setStep(3);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const reset = () => { setStep(1);setDtdcFiles([]);setCustFiles([]);setParsedDTDC([]);setParsedCusts([]);setResult(null);setError("");setModal(null); };
+
+  /* ── render ── */
+  return (
+    <div className="app">
+      <div className="mesh"/>
+
+      {/* HEADER */}
+      <header className="hdr">
+        <div className="hdr-in">
+          <div className="brand">
+            <div className="brand-badge">📦</div>
+            <div>
+              <div className="brand-name">Franchise P&L Analyser</div>
+              <div className="brand-sub">DEV SERVICE POINT · EF1478 · Madurai</div>
+            </div>
+          </div>
+          <div className="hdr-r">
+            {step<3 && (
+              <div className="stepper">
+                {["Upload Bills","Customers","Results"].map((s,i)=>(
+                  <div key={i} className={`stp ${step===i+1?"stp-a":step>i+1?"stp-d":""}`}>
+                    <span className="stp-n">{step>i+1?"✓":i+1}</span>
+                    <span className="stp-l">{s}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {step===3 && <button className="btn-out" onClick={reset}>↩ New Month</button>}
+          </div>
+        </div>
+      </header>
+
+      <main className="main">
+
+        {/* ═══ STEP 1 ═══ */}
+        {step===1 && (
+          <div className="card slide-up">
+            <div className="card-hd">
+              <h2>📁 Upload DTDC Bills</h2>
+              <p>Upload your DTDC franchise billing files. Supports <b>XLSX</b> (full data) and <b>PDF</b> (invoice scans). Multiple files allowed.</p>
+            </div>
+
+            {/* DTDC bills */}
+            <div className="label-row"><span className="sec-lbl">🟠 DTDC Franchise Bills (XLSX or PDF)</span></div>
+            <DropZone label="Drag & drop DTDC bill files here" hint="Accepts .xlsx and .pdf · Multiple files OK" accept={[".xlsx",".pdf"]} multiple color="#ff6b35"
+              files={dtdcFiles} onFiles={f=>setDtdcFiles(p=>[...p,...f.filter(n=>!p.some(x=>x.name===n.name))])}/>
+            {processing.dtdc && <div className="badge-proc">⏳ Parsing DTDC bills…</div>}
+            {parsedDTDC.length>0 && (
+              <div className="parsed-box" style={{"--pb":"#ff6b35"}}>
+                <div className="pb-ttl">✅ DTDC Bills Parsed</div>
+                <div className="pb-sumrow">
+                  <div className="pbs"><span>Total Bills</span><strong>{parsedDTDC.length}</strong></div>
+                  <div className="pbs"><span>Total DTDC Invoice</span><strong style={{color:"#ff6b35"}}>{INR(parsedDTDC.reduce((s,b)=>s+b.invoiceTotal,0))}</strong></div>
+                  <div className="pbs"><span>Total Consignments</span><strong>{parsedDTDC.reduce((s,b)=>s+b.consignments.length,0)}</strong></div>
+                </div>
+                {parsedDTDC.map((b,i)=>(
+                  <div key={i} className="pb-row">
+                    <span className="pb-type">{b.source==="pdf"?"📄":"📊"}</span>
+                    <span className="pb-inv">{b.invoiceNo}</span>
+                    <span className="pb-amt">{INR(b.invoiceTotal)}</span>
+                    <span className="pb-cn">{b.consignments.length} shipments</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Customer PDFs / XLSXs */}
+            <div className="label-row" style={{marginTop:20}}><span className="sec-lbl">🟢 Customer Invoices — PDF or Excel (GIN invoices you gave customers)</span></div>
+            <DropZone label="Drag & drop customer GIN invoice PDFs or Excel files" hint="Accepts .pdf, .xls and .xlsx · Auto-reads name, amount & C-notes · GST 18% auto-added · Multiple files OK" accept={[".pdf",".xls",".xlsx"]} multiple color="#00d4aa"
+              files={custFiles} onFiles={f=>setCustFiles(p=>[...p,...f.filter(n=>!p.some(x=>x.name===n.name))])}/>
+            {processing.cust && <div className="badge-proc" style={{borderColor:"#00d4aa44",color:"#00d4aa"}}>⏳ Parsing customer files…</div>}
+            {parsedCusts.length>0 && (
+              <div className="parsed-box" style={{"--pb":"#00d4aa"}}>
+                <div className="pb-ttl" style={{color:"#00d4aa"}}>✅ Customer Invoices Parsed</div>
+                {parsedCusts.map((c,i)=>(
+                  <div key={i} className="pb-row">
+                    <span className="pb-type">{c.source==="xls"||c.source==="xlsx"?"📊":"📄"}</span>
+                    <span className="pb-inv" style={{color:"#00d4aa"}}>{c.invoiceNo}</span>
+                    <span className="pb-name">{c.customerName}</span>
+                    <span style={{fontSize:10,fontWeight:700,padding:"2px 7px",borderRadius:10,background:c.rateType==="premium"?"rgba(255,64,129,.18)":"rgba(0,212,170,.12)",color:c.rateType==="premium"?"#ff4081":"#00d4aa",border:`1px solid ${c.rateType==="premium"?"#ff408144":"#00d4aa44"}`}}>{c.rateType==="premium"?"⭐ Premium":"Standard"}</span>
+                    <span className="pb-amt">{INR(c.totalInvoiceValue)}</span>
+                    {(c.source==="xls"||c.source==="xlsx") && c.gstAmount>0 && (
+                      <span style={{fontSize:11,color:"#ffab00",fontFamily:"monospace"}}>+GST {INR(c.gstAmount)}</span>
+                    )}
+                    <span className="pb-cn">{c.consignments.length} C-notes</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Expenses */}
+            <div className="label-row" style={{marginTop:20}}><span className="sec-lbl">💸 Monthly Expenses</span></div>
+            <div className="exp-list">
+              {expenses.map(e=>(
+                <div key={e.id} className="exp-item">
+                  <div className="exp-dot"/>
+                  <input className="inp" placeholder="Expense name" value={e.label} onChange={ev=>updExp(e.id,"label",ev.target.value)} style={{flex:2}}/>
+                  <div className="inp-pre"><span>₹</span><input className="inp" type="number" placeholder="0" value={e.amount} onChange={ev=>updExp(e.id,"amount",ev.target.value)} style={{border:"none",background:"transparent",flex:1}}/></div>
+                  {expenses.length>1 && <button className="x-btn" onClick={()=>rmExp(e.id)}>✕</button>}
+                </div>
+              ))}
+            </div>
+            <div className="add-exp-row">
+              <button className="btn-add" onClick={addExp}>+ Add Expense</button>
+              <span className="exp-ttl">Total: <b>{INR(totalExpAmt)}</b></span>
+            </div>
+
+            {/* Month */}
+            <div className="label-row" style={{marginTop:16}}><span className="sec-lbl">📅 Report Month</span></div>
+            <input className="inp" value={month} onChange={e=>setMonth(e.target.value)} style={{maxWidth:220}}/>
+
+            {error && <div className="err">{error}</div>}
+            <button className="btn-pri" onClick={()=>parsedDTDC.length?setStep(2):setError("Upload at least one DTDC bill first.")}>
+              Next: Customer Data →
+            </button>
+          </div>
+        )}
+
+        {/* ═══ STEP 2 ═══ */}
+        {step===2 && (
+          <div className="card slide-up">
+            <div className="card-hd">
+              <h2>👥 Account Customers</h2>
+              <p>{parsedCusts.length>0?`${parsedCusts.length} customer(s) auto-filled from PDFs.`:"No customer PDFs uploaded."} Add any extra customers manually below.</p>
+            </div>
+
+            {parsedCusts.length>0 && (
+              <div className="parsed-box" style={{"--pb":"#00d4aa",marginBottom:20}}>
+                <div className="pb-ttl" style={{color:"#00d4aa"}}>📄 Auto-filled from Customer Files</div>
+                {parsedCusts.map((c,i)=>(
+                  <div key={i} className="pb-row">
+                    <span style={{color:SEG_COLORS[i%SEG_COLORS.length],fontSize:18}}>●</span>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:700,fontSize:14}}>{c.customerName} <span style={{fontSize:11,color:"#888"}}>({c.source==="xls"?"XLS Excel":c.source==="xlsx"?"XLSX Excel":"PDF"})</span></div>
+                      <div style={{fontSize:11,color:"#888",fontFamily:"monospace"}}>
+                        {c.invoiceNo} · {c.consignments.length} shipments · {INR(c.totalInvoiceValue)}
+                        {c.gstAmount>0 && <span style={{color:"#ffab00"}}> (incl. GST {INR(c.gstAmount)} @ 18%)</span>}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="sec-lbl" style={{marginBottom:12}}>✍️ Manual Entry</div>
+            <div className="man-list">
+              {manual.map((m,i)=>(
+                <div key={m.id} className="man-card" style={{"--mc":SEG_COLORS[(parsedCusts.length+i)%SEG_COLORS.length]}}>
+                  <div className="man-hdr">
+                    <span>Customer {parsedCusts.length+i+1}</span>
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      {["standard","premium"].map(rt=>(
+                        <button key={rt} onClick={()=>updMan(m.id,"rateType",rt)} style={{fontSize:11,fontWeight:700,padding:"3px 10px",borderRadius:10,border:`1px solid ${m.rateType===rt?(rt==="premium"?"#ff4081":"#00d4aa"):"var(--bd)"}`,background:m.rateType===rt?(rt==="premium"?"rgba(255,64,129,.18)":"rgba(0,212,170,.12)"):"transparent",color:m.rateType===rt?(rt==="premium"?"#ff4081":"#00d4aa"):"var(--mt)",cursor:"pointer"}}>
+                          {rt==="premium"?"⭐ Premium":"Standard"}
+                        </button>
+                      ))}
+                      <button className="x-btn" onClick={()=>rmMan(m.id)}>✕</button>
+                    </div>
+                  </div>
+                  <input className="inp" placeholder="Customer Name (e.g. JN Machineries Pvt Ltd)" value={m.name} onChange={e=>updMan(m.id,"name",e.target.value)}/>
+                  <div style={{display:"flex",gap:8,marginTop:8}}>
+                    <input className="inp" placeholder="Invoice No (e.g. GIN0000149)" value={m.invoice} onChange={e=>updMan(m.id,"invoice",e.target.value)} style={{flex:1}}/>
+                    <input className="inp" type="number" placeholder="Total Revenue ₹ (incl. GST)" value={m.revenue} onChange={e=>updMan(m.id,"revenue",e.target.value)} style={{flex:1}}/>
+                  </div>
+                  <textarea className="inp" style={{marginTop:8,minHeight:70,resize:"vertical"}} placeholder="Paste all C-Note numbers — one per line or comma separated&#10;C57828449, C57828452, D2007104793…" value={m.cnotesRaw} onChange={e=>updMan(m.id,"cnotesRaw",e.target.value)}/>
+                </div>
+              ))}
+            </div>
+            <button className="btn-add" onClick={addMan}>+ Add Customer</button>
+
+            <div className="info-box" style={{marginTop:16}}>
+              🚶 <b>Walk-in customers</b> are auto-detected — any DTDC shipment not matched to an account customer will be priced using your Rate Card.
+            </div>
+
+            {error && <div className="err">{error}</div>}
+            <div style={{display:"flex",gap:10,marginTop:20}}>
+              <button className="btn-out" style={{flex:1,padding:"12px"}} onClick={()=>setStep(1)}>← Back</button>
+              <button className="btn-pri" style={{flex:2}} onClick={run} disabled={loading}>
+                {loading?"⏳ Calculating…":`🔢 Generate ${month} P&L Report →`}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 3: RESULTS ═══ */}
+        {step===3 && result && (
+          <div className="slide-up">
+
+            {/* Grand Banner */}
+            <div className={`grand ${result.grandNet>=0?"gp":"gl"}`}>
+              <div className="grand-logo"><div style={{width:42,height:42,background:"linear-gradient(135deg,#f5a623,#e8860a)",borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,boxShadow:"0 4px 14px rgba(245,166,35,.3)"}}>📦</div></div>
+              <div className="grand-info">
+                <div className="grand-mo">{month} — Profit & Loss Report</div>
+                <div className="grand-lbl">NET {result.grandNet>=0?"PROFIT":"LOSS"}</div>
+                <div className="grand-num">{result.grandNet<0?"-":""}{INR(Math.abs(result.grandNet))}</div>
+              </div>
+              <div className="grand-grid">
+                {[
+                  {l:"Total Revenue",v:INR(result.grandRev),c:"#00d4aa",i:"💰"},
+                  {l:"DTDC Total Cost",v:INR(result.grandDtdc),c:"#ff6b35",i:"🚚"},
+                  {l:"Gross Profit",v:INR(result.grandGross),c:"#7c4dff",i:"📈"},
+                  {l:"All Expenses",v:INR(result.totalExp),c:"#ff4081",i:"💸"},
+                  {l:"Total Shipments",v:result.totalShips,c:"#ffab00",i:"📦"},
+                  {l:"DTDC Cost Ratio",v:(result.ratio*100-100).toFixed(1)+"%",c:"#00b0ff",i:"🏷️"},
+                ].map((s,i)=>(
+                  <div key={i} className="gs" style={{"--gc":s.c}}>
+                    <div className="gs-i">{s.i}</div>
+                    <div className="gs-v">{s.v}</div>
+                    <div className="gs-l">{s.l}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Tabs */}
+            <div className="tabs">
+              {[{k:"overview",l:"📊 Overview"},{k:"walkin",l:"🚶 Walk-in"},{k:"breakdown",l:"📋 Full P&L"},{k:"compare",l:"⚖️ Compare"},{k:"ratecard",l:"💡 Rate Card"},{k:"dtdcbills",l:"🧾 DTDC Bills"}].map(t=>(
+                <button key={t.k} className={`tab${tab===t.k?" tab-a":""}`} onClick={()=>setTab(t.k)}>{t.l}</button>
+              ))}
+            </div>
+
+            {/* OVERVIEW */}
+            {tab==="overview" && (
+              <div className="seg-grid">
+                {result.segments.map((sg,i)=>{
+                  const c=SEG_COLORS[i%SEG_COLORS.length]; const pos=sg.net>=0;
+                  return (
+                    <div key={i} className="seg-card" style={{"--c":c}} onClick={()=>setModal(sg)}>
+                      <div className="sc-top">
+                        <div><div className="sc-name">{sg.name} {sg.rateType==="premium"&&<span style={{fontSize:10,background:"rgba(255,64,129,.18)",color:"#ff4081",border:"1px solid #ff408144",borderRadius:8,padding:"1px 6px",fontWeight:700}}>⭐ Premium</span>}</div><div className="sc-sub">{sg.invoice} · {sg.ships} shipments · <span style={{color:sg.source==="pdf"?"#00d4aa":(sg.source==="xls"||sg.source==="xlsx")?"#ffab00":sg.source==="auto"?"#7c4dff":"#00b0ff"}}>{sg.source==="pdf"?"📄 PDF":(sg.source==="xls"||sg.source==="xlsx")?"📊 Excel":sg.source==="auto"?"🤖 Auto":"✍️ Manual"}</span></div></div>
+                        <div className="sc-pct" style={{background:c+"22",color:c,border:`1px solid ${c}44`}}>{sg.margin.toFixed(1)}%</div>
+                      </div>
+                      <div className="sc-bars">
+                        {[{l:"Revenue",v:sg.revenue,max:sg.revenue,cl:"#00d4aa"},{l:"DTDC Cost",v:sg.dtdc,max:sg.revenue,cl:"#ff6b35"},{l:"Expenses",v:sg.sharedAlloc,max:sg.revenue,cl:"#7c4dff"}].map((b,bi)=>(
+                          <div key={bi} className="bar-row">
+                            <span>{b.l}</span>
+                            <div className="bar"><div className="bf" style={{width:b.max>0?Math.min(100,(b.v/b.max)*100)+"%":"0%",background:b.cl}}/></div>
+                            <b style={{fontFamily:"monospace",fontSize:12,color:b.cl}}>{INR(b.v)}</b>
+                          </div>
+                        ))}
+                      </div>
+                      <div className={`sc-net ${pos?"sc-p":"sc-l"}`}>
+                        <span>{pos?"🟢 Net Profit":"🔴 Net Loss"}</span>
+                        <strong>{sg.net<0?"-":""}{INR(Math.abs(sg.net))}</strong>
+                      </div>
+                      <div className="sc-tap">👆 Tap for consignment-wise DTDC rate vs my rate</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* WALK-IN */}
+            {tab==="walkin" && (
+              <div className="tbl-card">
+                <div className="tbl-ttl">🚶 Walk-in Shipments — Rate Card Applied ({result.walkin.length} shipments)</div>
+                <div className="tbl-wrap">
+                  <table className="tbl">
+                    <thead><tr><th>C-Note</th><th>Date</th><th>Destination</th><th>Zone</th><th>Wt(kg)</th><th>My Rate ₹</th><th>DTDC Cost ₹</th><th>Profit ₹</th></tr></thead>
+                    <tbody>
+                      {result.walkin.map((r,i)=>(
+                        <tr key={i} className={r.profit<0?"tr-loss":""}>
+                          <td className="mono">{r.cn}</td><td className="muted">{r.date}</td>
+                          <td><b>{r.dest}</b></td>
+                          <td><span className="zbadge" style={{background:ZCOLORS[r.zone]+"22",color:ZCOLORS[r.zone],border:`1px solid ${ZCOLORS[r.zone]}44`}}>{ZONES[r.zone]}</span></td>
+                          <td className="num">{r.weight.toFixed(3)}</td>
+                          <td className="num grn">{r.myRate.toFixed(2)}</td>
+                          <td className="num orn">{r.dtdcCost.toFixed(2)}</td>
+                          <td className={`num bold ${r.profit>=0?"grn":"red"}`}>{r.profit<0?"-":""}{Math.abs(r.profit).toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr>
+                        <td colSpan={5}><b>TOTAL</b></td>
+                        <td className="num grn"><b>{result.walkin.reduce((s,c)=>s+c.myRate,0).toFixed(2)}</b></td>
+                        <td className="num orn"><b>{result.walkin.reduce((s,c)=>s+c.dtdcCost,0).toFixed(2)}</b></td>
+                        <td className={`num bold ${result.walkin.reduce((s,c)=>s+c.profit,0)>=0?"grn":"red"}`}><b>{Math.abs(result.walkin.reduce((s,c)=>s+c.profit,0)).toFixed(2)}</b></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* FULL BREAKDOWN */}
+            {tab==="breakdown" && (
+              <div className="tbl-card">
+                <div className="tbl-ttl">📋 Complete P&L Breakdown — {month}</div>
+                <div className="tbl-wrap">
+                  <table className="tbl">
+                    <thead><tr><th>Segment</th><th>Ships</th><th>Revenue</th><th>DTDC Cost</th><th>Gross Profit</th><th>Shared Exp.</th><th>Net Profit</th><th>Margin</th></tr></thead>
+                    <tbody>
+                      {result.segments.map((sg,i)=>(
+                        <tr key={i} className="tr-click" onClick={()=>setModal(sg)}>
+                          <td><span style={{color:SEG_COLORS[i%SEG_COLORS.length],marginRight:6}}>●</span><b>{sg.name}</b><br/><small className="muted">{sg.invoice}</small></td>
+                          <td className="num">{sg.ships}</td>
+                          <td className="num grn">{INR(sg.revenue)}</td>
+                          <td className="num orn">{INR(sg.dtdc)}</td>
+                          <td className={`num ${sg.gross>=0?"grn":"red"}`}>{INR(sg.gross)}</td>
+                          <td className="num muted">{INR(sg.sharedAlloc)}</td>
+                          <td className={`num bold ${sg.net>=0?"grn":"red"}`}>{sg.net<0?"-":""}{INR(Math.abs(sg.net))}</td>
+                          <td className={`num ${sg.margin>=0?"grn":"red"}`}>{sg.margin.toFixed(1)}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr>
+                        <td><b>GRAND TOTAL</b></td>
+                        <td className="num"><b>{result.totalShips}</b></td>
+                        <td className="num grn"><b>{INR(result.grandRev)}</b></td>
+                        <td className="num orn"><b>{INR(result.grandDtdc)}</b></td>
+                        <td className="num grn"><b>{INR(result.grandGross)}</b></td>
+                        <td className="num"><b>{INR(result.totalExp)}</b></td>
+                        <td className={`num bold ${result.grandNet>=0?"grn":"red"}`}><b>{result.grandNet<0?"-":""}{INR(Math.abs(result.grandNet))}</b></td>
+                        <td className={`num ${result.grandNet>=0?"grn":"red"}`}><b>{result.grandRev>0?((result.grandNet/result.grandRev)*100).toFixed(1):0}%</b></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+                <div className="tbl-note">👆 Click any row to see consignment-wise My Rate vs DTDC Cost</div>
+              </div>
+            )}
+
+            {/* COMPARE: DTDC Consignment Amount vs Customer Bill Amount */}
+            {tab==="compare" && (()=>{
+              const rows = result.compareRows || [];
+              const totalDtdc = rows.reduce((s,r)=>s+r.dtdcAmt,0);
+              const totalCust = rows.reduce((s,r)=>s+r.custAmt,0);
+              const totalDiff = rows.reduce((s,r)=>s+r.diff,0);
+              const matched   = rows.filter(r=>r.custAmt>0).length;
+              const unmatched = rows.filter(r=>r.custAmt===0).length;
+              const profitable= rows.filter(r=>r.diff>0).length;
+              const losing    = rows.filter(r=>r.diff<0).length;
+              return (
+                <div>
+                  {/* Summary strip */}
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(170px,1fr))",gap:12,marginBottom:20}}>
+                    {[
+                      {l:"Total Consignments", v:rows.length, c:"#00b0ff", i:"📦"},
+                      {l:"Matched to Customer", v:matched, c:"#00d4aa", i:"✅"},
+                      {l:"Unmatched (Walk-in)", v:unmatched, c:"#ffab00", i:"🚶"},
+                      {l:"DTDC Total Cost",     v:INR(totalDtdc), c:"#ff6b35", i:"🧾"},
+                      {l:"Customer Billed",     v:INR(totalCust), c:"#00d4aa", i:"💰"},
+                      {l:"Net Difference",      v:(totalDiff>=0?"+ ":"")+INR(totalDiff), c:totalDiff>=0?"#00e676":"#ff5252", i:totalDiff>=0?"🟢":"🔴"},
+                    ].map((s,i)=>(
+                      <div key={i} className="gs" style={{"--gc":s.c,background:"var(--s1)",border:"1px solid var(--bd)",borderTop:`2px solid ${s.c}`,borderRadius:12,padding:14}}>
+                        <div className="gs-i">{s.i}</div>
+                        <div className="gs-v" style={{color:s.c}}>{s.v}</div>
+                        <div className="gs-l">{s.l}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* profit/loss pill row */}
+                  <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+                    <span style={{background:"rgba(0,230,118,.12)",border:"1px solid rgba(0,230,118,.3)",color:"#00e676",padding:"5px 14px",borderRadius:20,fontSize:13,fontWeight:700}}>
+                      🟢 {profitable} Profitable C-notes
+                    </span>
+                    <span style={{background:"rgba(255,82,82,.12)",border:"1px solid rgba(255,82,82,.3)",color:"#ff5252",padding:"5px 14px",borderRadius:20,fontSize:13,fontWeight:700}}>
+                      🔴 {losing} Loss-making C-notes
+                    </span>
+                    <span style={{background:"rgba(255,171,0,.12)",border:"1px solid rgba(255,171,0,.3)",color:"#ffab00",padding:"5px 14px",borderRadius:20,fontSize:13,fontWeight:700}}>
+                      🟡 {unmatched} Walk-in / Unmatched
+                    </span>
+                  </div>
+
+                  <div className="tbl-card">
+                    <div className="tbl-ttl">⚖️ DTDC Consignment Amount vs Customer Bill Amount — {rows.length} shipments (sorted: worst first)</div>
+                    <div className="tbl-wrap">
+                      <table className="tbl">
+                        <thead>
+                          <tr>
+                            <th>#</th>
+                            <th>C-Note</th>
+                            <th>Date</th>
+                            <th>Destination</th>
+                            <th>Wt (kg)</th>
+                            <th>Customer</th>
+                            <th>Invoice</th>
+                            <th style={{textAlign:"right"}}>DTDC Cost ₹</th>
+                            <th style={{textAlign:"right"}}>Cust. Bill ₹</th>
+                            <th style={{textAlign:"right"}}>Diff ₹</th>
+                            <th style={{textAlign:"right"}}>Status</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rows.map((r,i)=>{
+                            const pos = r.diff >= 0;
+                            const noData = r.custAmt === 0;
+                            return (
+                              <tr key={i} className={!pos && !noData ? "tr-loss" : ""}>
+                                <td className="muted" style={{fontSize:11}}>{i+1}</td>
+                                <td className="mono">{r.cn}</td>
+                                <td className="muted">{r.date}</td>
+                                <td><b>{r.destination || "—"}</b></td>
+                                <td className="num">{r.weight.toFixed(3)}</td>
+                                <td style={{fontSize:12,maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.customerName}</td>
+                                <td className="mono" style={{fontSize:11,color:"#888"}}>{r.invoice}</td>
+                                <td className="num orn">{r.dtdcAmt.toFixed(2)}</td>
+                                <td className={`num ${noData?"muted":"grn"}`}>{noData?"—":r.custAmt.toFixed(2)}</td>
+                                <td className={`num bold ${noData?"muted":pos?"grn":"red"}`}>
+                                  {noData?"—":(r.diff<0?"-":"+") + Math.abs(r.diff).toFixed(2)}
+                                </td>
+                                <td style={{textAlign:"right"}}>
+                                  {noData
+                                    ? <span className="zbadge" style={{background:"#ffab0022",color:"#ffab00",border:"1px solid #ffab0044"}}>Walk-in</span>
+                                    : pos
+                                      ? <span className="zbadge" style={{background:"#00e67622",color:"#00e676",border:"1px solid #00e67644"}}>✓ Profit</span>
+                                      : <span className="zbadge" style={{background:"#ff525222",color:"#ff5252",border:"1px solid #ff525244"}}>✗ Loss</span>
+                                  }
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                        <tfoot>
+                          <tr>
+                            <td colSpan={7}><b>TOTAL ({rows.length} consignments)</b></td>
+                            <td className="num bold orn">{totalDtdc.toFixed(2)}</td>
+                            <td className="num bold grn">{totalCust.toFixed(2)}</td>
+                            <td className={`num bold ${totalDiff>=0?"grn":"red"}`}>{totalDiff<0?"-":"+"}{ Math.abs(totalDiff).toFixed(2)}</td>
+                            <td/>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                    <div className="tbl-note">⚖️ Diff = Customer Billed − DTDC Cost. Positive = you earned more than DTDC charged. Negative = you charged less than DTDC cost (loss).</div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* RATE CARD */}
+            {tab==="ratecard" && (
+              <div>
+                <div style={{background:"rgba(34,197,94,.06)",border:"1px solid rgba(34,197,94,.18)",color:"#86efac",padding:"12px 16px",borderRadius:11,fontSize:13,marginBottom:22,lineHeight:1.6}}>
+                  ✅ Source: <b>DTDC Standard &amp; Premium Tariff — Domestic</b> &nbsp;·&nbsp; All amounts include GST &nbsp;·&nbsp; Above 1 kg: <b>weight rounded UP to next full kg</b>, then charged per-kg rate &nbsp;·&nbsp; Above 5 kg: flat per-kg
+                </div>
+
+                {/* Standard */}
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                  <span style={{fontFamily:"var(--font)",fontWeight:700,fontSize:13,color:"var(--te)"}}>📦 Standard Tariff</span>
+                  <span style={{flex:1,height:1,background:"var(--bd)"}}/>
+                  <span style={{fontSize:11,color:"var(--mt)",fontFamily:"var(--mono)"}}>surface · local</span>
+                </div>
+                <div className="rc-grid" style={{marginBottom:28}}>
+                  {Object.entries(RATES).map(([z,r])=>{
+                    const eg1 = r[2] + Math.ceil(0.3)*r[3]; // 1.3kg
+                    const eg2 = r[2] + Math.ceil(1.5)*r[3]; // 2.5kg→3kg
+                    const eg3 = Math.ceil(5)*r[3];           // 5kg
+                    const eg4 = Math.ceil(6)*r[3];           // 6kg
+                    return (
+                      <div key={z} className="rc-card" style={{"--zc":ZCOLORS[z]}}>
+                        <div className="rc-zone">{ZONES[z]}</div>
+                        <div className="rc-mode">{z==="TAMIL_NADU"||z==="AP_KA_KL_TS"||z==="MADURAI_CITY"?"SURFACE":"AIR"} <span className="rc-upd">GST ✓</span></div>
+                        <div className="rc-rows">
+                          <div className="rc-row"><span>≤ 250g</span><strong>₹{r[0]}</strong></div>
+                          <div className="rc-row"><span>≤ 500g</span><strong>₹{r[1]}</strong></div>
+                          <div className="rc-row"><span>≤ 1 kg</span><strong>₹{r[2]}</strong></div>
+                          <div className="rc-row"><span>1–5 kg /kg</span><strong>₹{r[3]}</strong></div>
+                          <div className="rc-row"><span>&gt; 5 kg /kg</span><strong>₹{r[3]}</strong></div>
+                        </div>
+                        <div className="rc-example">
+                          1.3 kg → ₹{r[2]+Math.ceil(0.3)*r[3]}&nbsp; 2.5 kg → ₹{r[2]+Math.ceil(1.5)*r[3]}<br/>
+                          5 kg → ₹{Math.ceil(5)*r[3]}&nbsp;&nbsp; 6 kg → ₹{Math.ceil(6)*r[3]}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Premium */}
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                  <span style={{fontFamily:"var(--font)",fontWeight:700,fontSize:13,color:"var(--pk)"}}>⭐ Premium Tariff (V-Series)</span>
+                  <span style={{flex:1,height:1,background:"var(--bd)"}}/>
+                  <span style={{fontSize:11,color:"var(--mt)",fontFamily:"var(--mono)"}}>V-prefix files auto-assigned</span>
+                </div>
+                <div className="rc-grid">
+                  {Object.entries(PREMIUM_RATES).map(([z,r])=>(
+                    <div key={z} className="rc-card" style={{"--zc":"#ec4899"}}>
+                      <div className="rc-zone" style={{color:"#ec4899"}}>{ZONES[z]}</div>
+                      <div className="rc-mode" style={{color:"#ec489988"}}>PREMIUM <span style={{background:"rgba(236,72,153,.12)",color:"#ec4899",border:"1px solid rgba(236,72,153,.25)",fontSize:9,padding:"1px 7px",borderRadius:10,fontWeight:600,marginLeft:4}}>⭐</span></div>
+                      <div className="rc-rows">
+                        <div className="rc-row"><span>≤ 250g</span><strong style={{color:"#ec4899"}}>₹{r[0]}</strong></div>
+                        <div className="rc-row"><span>≤ 500g</span><strong style={{color:"#ec4899"}}>₹{r[1]}</strong></div>
+                        <div className="rc-row"><span>≤ 1 kg</span><strong style={{color:"#ec4899"}}>₹{r[2]}</strong></div>
+                        <div className="rc-row"><span>&gt; 1 kg /kg</span><strong style={{color:"#ec4899"}}>₹{r[2]}</strong></div>
+                      </div>
+                      <div className="rc-example" style={{color:"#ec489966"}}>
+                        1.3 kg → ₹{Math.ceil(1.3)*r[2]}&nbsp; 2 kg → ₹{Math.ceil(2)*r[2]}<br/>
+                        3 kg → ₹{Math.ceil(3)*r[2]}&nbsp; 5 kg → ₹{Math.ceil(5)*r[2]}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* DTDC BILLS TAB */}
+            {tab==="dtdcbills" && (
+              <div className="tbl-card">
+                <div className="tbl-ttl">🧾 DTDC Bill Summary — {result.dtdcBills.length} Invoice(s)</div>
+                <div className="tbl-wrap">
+                  <table className="tbl">
+                    <thead><tr><th>Invoice No.</th><th>Type</th><th>Base Amount</th><th>Fuel Charge</th><th>Total Invoice</th><th>Shipments</th></tr></thead>
+                    <tbody>
+                      {result.dtdcBills.map((b,i)=>(
+                        <tr key={i}>
+                          <td className="mono">{b.invoiceNo}</td>
+                          <td><span className="zbadge" style={{background:"#ff6b3522",color:"#ff6b35",border:"1px solid #ff6b3544"}}>{b.source==="pdf"?"PDF":"XLSX"}</span></td>
+                          <td className="num">{INR(b.baseAmount)}</td>
+                          <td className="num orn">{INR(b.fuelCharge)}</td>
+                          <td className="num bold orn">{INR(b.invoiceTotal)}</td>
+                          <td className="num">{b.consignments.length}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr>
+                        <td colSpan={4}><b>GRAND TOTAL</b></td>
+                        <td className="num bold orn"><b>{INR(result.dtdcBills.reduce((s,b)=>s+b.invoiceTotal,0))}</b></td>
+                        <td className="num"><b>{result.dtdcBills.reduce((s,b)=>s+b.consignments.length,0)}</b></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+                <div className="overhead-box">
+                  <span>📊 Overhead Ratio (fuel+GST factor applied per shipment):</span>
+                  <strong style={{color:"#ff6b35"}}>{result.ratio.toFixed(4)}×</strong>
+                  <span className="muted">= every ₹1 base DTDC charge costs you ₹{result.ratio.toFixed(2)} total</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      {modal && <DetailModal seg={modal} onClose={()=>setModal(null)}/>}
+
+<style>{`
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{
+  --bg:#0a0c0f;--s1:#0f1117;--s2:#151821;--s3:#1c2030;--s4:#222637;
+  --bd:rgba(255,255,255,.06);--bd2:rgba(255,255,255,.10);
+  --tx:#e8ecf5;--mt:#5a6180;--mt2:#7a83a8;
+  --am:#f5a623;--am2:#ffbe4d;--am3:rgba(245,166,35,.12);
+  --te:#00c9a0;--te2:rgba(0,201,160,.12);
+  --re:#f05252;--re2:rgba(240,82,82,.12);
+  --gr:#22c55e;--gr2:rgba(34,197,94,.12);
+  --bl:#3b82f6;--pu:#8b5cf6;--pk:#ec4899;
+  --font:'Sora',sans-serif;--mono:'IBM Plex Mono',monospace;--body:'DM Sans',sans-serif;
+}
+body{background:var(--bg);color:var(--tx);font-family:var(--body);min-height:100vh;line-height:1.5;}
+
+/* NOISE TEXTURE OVERLAY */
+.mesh{position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 1100px 600px at 0% 0%,rgba(245,166,35,.06) 0%,transparent 60%),
+    radial-gradient(ellipse 800px 800px at 100% 80%,rgba(0,201,160,.05) 0%,transparent 60%),
+    radial-gradient(ellipse 500px 500px at 50% 50%,rgba(139,92,246,.03) 0%,transparent 60%);
+}
+.mesh::after{content:"";position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");opacity:.4;pointer-events:none;}
+.app{position:relative;z-index:1;}
+
+@keyframes su{from{opacity:0;transform:translateY(20px);}to{opacity:1;transform:translateY(0);}}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.5;}}
+.slide-up{animation:su .35s cubic-bezier(.22,1,.36,1);}
+
+/* ── HEADER ── */
+.hdr{background:rgba(10,12,15,.95);backdrop-filter:blur(24px);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:100;}
+.hdr-in{max-width:1200px;margin:0 auto;padding:0 24px;height:62px;display:flex;align-items:center;justify-content:space-between;gap:16px;}
+.brand{display:flex;align-items:center;gap:14px;}
+.brand-badge{background:linear-gradient(135deg,#f5a623,#e8860a);width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;box-shadow:0 4px 12px rgba(245,166,35,.3);}
+.brand-name{font-family:var(--font);font-size:15px;font-weight:700;color:var(--tx);letter-spacing:-.01em;}
+.brand-sub{font-size:10px;color:var(--mt);letter-spacing:.06em;text-transform:uppercase;margin-top:1px;}
+.hdr-r{display:flex;align-items:center;gap:8px;}
+
+/* ── STEPPER ── */
+.stepper{display:flex;align-items:center;gap:0;}
+.stp{display:flex;align-items:center;gap:8px;padding:6px 14px;font-size:12px;color:var(--mt);font-family:var(--font);font-weight:500;position:relative;}
+.stp:not(:last-child)::after{content:"›";margin-left:4px;color:var(--bd2);font-size:16px;}
+.stp-n{width:22px;height:22px;border-radius:6px;background:var(--s3);border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;font-family:var(--mono);}
+.stp-a{color:var(--am);}
+.stp-a .stp-n{background:linear-gradient(135deg,#f5a623,#e8860a);border-color:transparent;color:#000;}
+.stp-d{color:var(--te);}
+.stp-d .stp-n{background:var(--te2);border-color:rgba(0,201,160,.3);color:var(--te);}
+
+/* ── MAIN ── */
+.main{max-width:1200px;margin:0 auto;padding:28px 24px;}
+
+/* ── CARD ── */
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:18px;padding:32px;}
+.card-hd{margin-bottom:28px;}
+.card-hd h2{font-family:var(--font);font-size:22px;font-weight:700;letter-spacing:-.02em;margin-bottom:6px;}
+.card-hd p{color:var(--mt2);font-size:14px;line-height:1.65;}
+
+/* ── SECTION LABELS ── */
+.label-row{margin-bottom:8px;}
+.sec-lbl{font-size:11px;font-weight:600;color:var(--mt2);letter-spacing:.08em;text-transform:uppercase;}
+
+/* ── DROPZONE ── */
+.dz{border:1.5px dashed color-mix(in srgb,var(--dc) 35%,transparent);border-radius:14px;padding:26px 20px;cursor:pointer;transition:all .2s;background:color-mix(in srgb,var(--dc) 3%,transparent);min-height:86px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;position:relative;}
+.dz:hover,.dz-d{background:color-mix(in srgb,var(--dc) 8%,transparent);border-style:solid;border-color:color-mix(in srgb,var(--dc) 60%,transparent);}
+.dz-ok{border-style:solid;border-color:color-mix(in srgb,var(--dc) 50%,transparent);background:color-mix(in srgb,var(--dc) 5%,transparent);}
+.dz-lbl{font-size:14px;font-weight:600;color:var(--dc);font-family:var(--font);}
+.dz-hint{font-size:11px;color:var(--mt);text-align:center;}
+.dz-chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;}
+.chip{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--gr);padding:3px 10px;border-radius:20px;font-size:11px;font-family:var(--mono);}
+
+/* ── PARSED BOX ── */
+.badge-proc{background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:var(--am);padding:9px 14px;border-radius:8px;font-size:13px;margin:8px 0;text-align:center;animation:pulse 1.4s ease infinite;}
+.parsed-box{background:rgba(255,255,255,.02);border:1px solid color-mix(in srgb,var(--pb) 20%,transparent);border-radius:14px;padding:16px;margin-top:10px;}
+.pb-ttl{font-size:10px;font-weight:600;color:var(--pb);text-transform:uppercase;letter-spacing:.1em;margin-bottom:14px;display:flex;align-items:center;gap:8px;}
+.pb-ttl::after{content:"";flex:1;height:1px;background:color-mix(in srgb,var(--pb) 20%,transparent);}
+.pb-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.03);font-size:13px;flex-wrap:wrap;}
+.pb-row:last-child{border:none;}
+.pb-type{font-size:16px;flex-shrink:0;}
+.pb-inv{font-family:var(--mono);font-size:10px;color:var(--pb);flex-shrink:0;background:color-mix(in srgb,var(--pb) 10%,transparent);padding:2px 7px;border-radius:5px;}
+.pb-name{font-weight:600;flex:1;min-width:100px;font-size:13px;}
+.pb-amt{font-weight:700;color:var(--te);flex-shrink:0;font-family:var(--mono);font-size:13px;}
+.pb-cn{font-size:10px;color:var(--mt);flex-shrink:0;background:var(--s3);padding:2px 8px;border-radius:20px;}
+
+/* ── EXPENSES ── */
+.exp-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px;}
+.exp-item{display:flex;align-items:center;gap:8px;}
+.exp-dot{width:6px;height:6px;border-radius:50%;background:var(--am);flex-shrink:0;}
+.inp-pre{display:flex;align-items:center;background:var(--s2);border:1px solid var(--bd);border-radius:9px;overflow:hidden;flex:1.2;}
+.inp-pre span{padding:0 12px;color:var(--mt2);font-weight:600;border-right:1px solid var(--bd);font-family:var(--mono);font-size:13px;}
+.add-exp-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;}
+.btn-add{background:transparent;border:1px dashed var(--bd2);color:var(--mt2);padding:9px 18px;border-radius:9px;cursor:pointer;font-family:var(--font);font-size:12px;font-weight:600;transition:all .2s;letter-spacing:.02em;}
+.btn-add:hover{border-color:var(--am);color:var(--am);}
+.exp-ttl{font-size:13px;color:var(--mt);}
+.exp-ttl b{color:var(--am);}
+.info-box{background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.18);color:#93c5fd;padding:13px 16px;border-radius:11px;font-size:13px;line-height:1.6;}
+
+/* ── INPUTS ── */
+.inp{background:var(--s2);border:1px solid var(--bd);color:var(--tx);padding:11px 14px;border-radius:9px;font-family:var(--body);font-size:14px;outline:none;width:100%;transition:border-color .2s,box-shadow .2s;}
+.inp:focus{border-color:rgba(245,166,35,.5);box-shadow:0 0 0 3px rgba(245,166,35,.08);}
+.inp::placeholder{color:var(--mt);}
+.x-btn{background:none;border:none;color:var(--mt);cursor:pointer;font-size:15px;padding:5px 8px;border-radius:6px;transition:all .2s;flex-shrink:0;}
+.x-btn:hover{color:var(--re);background:var(--re2);}
+.btn-pri{background:linear-gradient(135deg,#f5a623 0%,#e8860a 100%);color:#000;border:none;padding:15px 24px;border-radius:11px;font-family:var(--font);font-size:15px;font-weight:700;cursor:pointer;transition:all .25s;width:100%;margin-top:8px;letter-spacing:-.01em;box-shadow:0 4px 24px rgba(245,166,35,.25);}
+.btn-pri:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 8px 32px rgba(245,166,35,.4);}
+.btn-pri:disabled{opacity:.45;cursor:not-allowed;}
+.btn-out{background:var(--s2);border:1px solid var(--bd2);color:var(--mt2);padding:9px 18px;border-radius:9px;cursor:pointer;font-family:var(--font);font-size:13px;font-weight:600;transition:all .2s;}
+.btn-out:hover{color:var(--tx);border-color:var(--am);}
+.err{background:var(--re2);border:1px solid rgba(240,82,82,.3);color:var(--re);padding:11px 16px;border-radius:9px;font-size:13px;margin:10px 0;}
+
+/* ── MANUAL CARDS ── */
+.man-list{display:flex;flex-direction:column;gap:14px;margin-bottom:12px;}
+.man-card{background:var(--s2);border:1px solid var(--bd);border-left:3px solid var(--mc);border-radius:13px;padding:18px;}
+.man-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:12px;font-weight:600;color:var(--mc);font-family:var(--font);text-transform:uppercase;letter-spacing:.05em;}
+
+/* ── GRAND BANNER ── */
+.grand{border-radius:18px;padding:28px;margin-bottom:22px;display:grid;grid-template-columns:auto 1fr;gap:20px;position:relative;overflow:hidden;}
+.grand::before{content:"";position:absolute;top:-60px;right:-60px;width:280px;height:280px;border-radius:50%;opacity:.06;background:radial-gradient(circle,#fff,transparent);}
+.gp{background:linear-gradient(135deg,#071510 0%,#0b1f14 50%,#071510 100%);border:1px solid rgba(34,197,94,.15);}
+.gl{background:linear-gradient(135deg,#150707 0%,#1f0b0b 50%,#150707 100%);border:1px solid rgba(240,82,82,.15);}
+.grand-logo{grid-column:1/2;grid-row:1/2;align-self:start;position:relative;z-index:1;}
+.grand-info{grid-column:1/2;grid-row:2/3;position:relative;z-index:1;}
+.grand-mo{font-size:10px;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.12em;margin-bottom:6px;font-family:var(--font);}
+.grand-lbl{font-size:11px;font-weight:700;color:rgba(255,255,255,.45);text-transform:uppercase;letter-spacing:.14em;font-family:var(--font);}
+.grand-num{font-size:52px;font-weight:700;color:#fff;font-family:var(--mono);line-height:1;margin-top:5px;letter-spacing:-.03em;}
+.grand-grid{grid-column:2/3;grid-row:1/3;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;align-content:center;position:relative;z-index:1;}
+@media(max-width:700px){.grand{grid-template-columns:1fr;}.grand-grid{grid-column:1;grid-row:auto;grid-template-columns:repeat(2,1fr);}.grand-info{grid-row:auto;}}
+.gs{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);border-top:2px solid var(--gc);border-radius:10px;padding:12px;}
+.gs-i{font-size:17px;margin-bottom:5px;}
+.gs-v{font-size:14px;font-weight:600;color:#fff;font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.gs-l{font-size:9px;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.07em;margin-top:2px;font-family:var(--font);}
+
+/* ── TABS ── */
+.tabs{display:flex;gap:2px;background:var(--s2);border:1px solid var(--bd);border-radius:13px;padding:5px;margin-bottom:22px;overflow-x:auto;}
+.tab{flex:1;padding:9px 8px;border:none;border-radius:9px;font-family:var(--font);font-size:12px;font-weight:600;cursor:pointer;background:transparent;color:var(--mt);transition:all .2s;white-space:nowrap;letter-spacing:.01em;}
+.tab-a{background:linear-gradient(135deg,#f5a623,#e8860a);color:#000;box-shadow:0 2px 14px rgba(245,166,35,.3);}
+.tab:hover:not(.tab-a){color:var(--tx);background:var(--s3);}
+
+/* ── SEGMENT CARDS ── */
+.seg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(265px,1fr));gap:16px;}
+.seg-card{background:var(--s1);border:1px solid var(--bd);border-radius:16px;padding:20px;cursor:pointer;transition:all .25s;position:relative;overflow:hidden;}
+.seg-card::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--c),color-mix(in srgb,var(--c) 60%,transparent));}
+.seg-card:hover{transform:translateY(-4px);box-shadow:0 20px 48px rgba(0,0,0,.5),0 0 0 1px color-mix(in srgb,var(--c) 40%,transparent);}
+.sc-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:16px;}
+.sc-name{font-family:var(--font);font-size:14px;font-weight:700;letter-spacing:-.01em;}
+.sc-sub{font-size:10px;color:var(--mt);margin-top:4px;font-family:var(--mono);}
+.sc-pct{padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;flex-shrink:0;font-family:var(--mono);}
+.sc-bars{display:flex;flex-direction:column;gap:9px;margin-bottom:14px;}
+.bar-row{display:flex;align-items:center;gap:8px;font-size:11px;}
+.bar-row span{width:58px;color:var(--mt);flex-shrink:0;font-family:var(--font);}
+.bar-row b{margin-left:auto;flex-shrink:0;font-family:var(--mono);font-size:11px;}
+.bar{flex:1;height:4px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;}
+.bf{height:100%;border-radius:3px;transition:width .9s cubic-bezier(.4,0,.2,1);}
+.sc-net{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:10px;margin-bottom:6px;}
+.sc-p{background:var(--gr2);border:1px solid rgba(34,197,94,.2);}
+.sc-l{background:var(--re2);border:1px solid rgba(240,82,82,.2);}
+.sc-net span{font-size:11px;font-family:var(--font);font-weight:600;}
+.sc-net strong{font-size:14px;font-weight:700;font-family:var(--mono);}
+.sc-tap{font-size:10px;color:var(--mt);text-align:center;margin-top:4px;}
+
+/* ── TABLES ── */
+.tbl-card{background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden;}
+.tbl-ttl{padding:15px 20px;font-size:13px;font-weight:700;border-bottom:1px solid var(--bd);background:var(--s2);font-family:var(--font);display:flex;align-items:center;gap:8px;}
+.tbl-wrap{overflow-x:auto;}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px;}
+.tbl th{background:var(--s2);padding:10px 14px;text-align:left;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid var(--bd);white-space:nowrap;font-family:var(--font);}
+.tbl td{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.025);vertical-align:middle;}
+.tbl tbody tr:hover{background:rgba(255,255,255,.025);}
+.tbl tfoot td{background:var(--s2);border-top:1px solid var(--bd2);font-weight:700;padding:11px 14px;font-family:var(--font);}
+.tr-loss{background:rgba(240,82,82,.03);}
+.tr-click{cursor:pointer;}
+.tr-click:hover{background:rgba(245,166,35,.04)!important;}
+.tbl-note{padding:10px 20px;font-size:11px;color:var(--mt);text-align:center;border-top:1px solid var(--bd);}
+.overhead-box{padding:12px 20px;background:rgba(245,166,35,.05);border-top:1px solid rgba(245,166,35,.12);font-size:13px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;}
+
+/* ── RATE CARD ── */
+.rc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px;}
+.rc-card{background:var(--s1);border:1px solid var(--bd);border-top:3px solid var(--zc);border-radius:13px;padding:18px;transition:all .2s;}
+.rc-card:hover{background:var(--s2);transform:translateY(-2px);}
+.rc-zone{font-size:12px;font-weight:700;color:var(--zc);margin-bottom:4px;font-family:var(--font);display:flex;align-items:center;gap:6px;}
+.rc-mode{font-size:10px;color:var(--mt);margin-bottom:12px;font-family:var(--mono);}
+.rc-rows{display:flex;flex-direction:column;gap:7px;}
+.rc-row{display:flex;justify-content:space-between;font-size:12.5px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03);}
+.rc-row:last-child{border:none;}
+.rc-row span{color:var(--mt2);}
+.rc-row strong{font-family:var(--mono);color:var(--tx);font-size:13px;}
+.rc-upd{font-size:9px;background:rgba(34,197,94,.12);color:var(--gr);border:1px solid rgba(34,197,94,.25);padding:1px 7px;border-radius:10px;font-weight:600;vertical-align:middle;margin-left:auto;}
+.rc-example{margin-top:10px;padding-top:10px;border-top:1px solid var(--bd);font-size:10px;color:var(--mt);font-family:var(--mono);line-height:1.7;}
+
+/* ── MODAL ── */
+.mb{position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(12px);z-index:200;display:flex;align-items:center;justify-content:center;padding:16px;animation:fadeIn .2s ease;}
+.md{background:var(--s1);border:1px solid var(--bd2);border-radius:18px;width:100%;max-width:1000px;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 32px 80px rgba(0,0,0,.7);}
+.md-hdr{display:flex;justify-content:space-between;align-items:center;padding:20px 24px;border-bottom:1px solid var(--bd);background:var(--s2);flex-shrink:0;}
+.md-title{font-family:var(--font);font-size:17px;font-weight:700;letter-spacing:-.01em;}
+.md-sub{font-size:11px;color:var(--mt);margin-top:3px;font-family:var(--mono);}
+.md-body{display:flex;flex-direction:column;overflow:hidden;flex:1;}
+.md-search{margin:12px 16px;width:calc(100% - 32px);}
+
+/* ── COMMON ── */
+.mono{font-family:var(--mono);font-size:11px;}
+.num{text-align:right;font-family:var(--mono);}
+.bold{font-weight:700;}
+.grn{color:var(--gr);}
+.red{color:var(--re);}
+.orn{color:var(--am);}
+.muted{color:var(--mt);}
+.zbadge{padding:2px 9px;border-radius:20px;font-size:10px;font-weight:700;white-space:nowrap;font-family:var(--font);}
+`}</style>
+    </div>
+  );
+}
+
+
+  // ── Mount ────────────────────────────────────────────────────────
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(<App />);
+
+  // Hide splash after render
+  setTimeout(() => {
+    const s = document.getElementById('splash');
+    if (s) { s.style.opacity='0'; s.style.transition='opacity .4s'; setTimeout(()=>s.remove(),400); }
+  }, 800);
+</script>
+
+</body>
+</html>
